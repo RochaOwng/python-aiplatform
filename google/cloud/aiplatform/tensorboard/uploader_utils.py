@@ -24,6 +24,7 @@ import re
 import time
 from typing import Callable, Dict, Generator, Optional, List, Tuple
 import uuid
+import grpc
 
 from tensorboard.util import tb_logging
 
@@ -32,7 +33,9 @@ from google.cloud import storage
 from google.cloud.aiplatform.compat.types import tensorboard_run
 from google.cloud.aiplatform.compat.types import tensorboard_service
 from google.cloud.aiplatform.compat.types import tensorboard_time_series
-from google.cloud.aiplatform.compat.services import tensorboard_service_client
+from google.cloud.aiplatform.compat.services import (
+    tensorboard_service_client,
+)
 
 TensorboardServiceClient = tensorboard_service_client.TensorboardServiceClient
 
@@ -477,4 +480,35 @@ def request_logger(
         "Upload of (%d bytes) took %.3f seconds",
         request_bytes,
         upload_duration_secs,
+    )
+
+
+def get_blob_storage_bucket_and_folder(
+    api_client: TensorboardServiceClient,
+    tensorboard_resource_name: str,
+    project_id: str,
+) -> tuple[str, str]:
+    try:
+        tensorboard = api_client.get_tensorboard(name=tensorboard_resource_name)
+    except grpc.RpcError as rpc_error:
+        if rpc_error.code() == grpc.StatusCode.NOT_FOUND:
+            raise app.UsageError(
+                "Tensorboard resource %s not found" % tensorboard_resource_name,
+                exitcode=0,
+            ) from rpc_error
+        raise
+
+    if tensorboard.blob_storage_path_prefix:
+        path_prefix = tensorboard.blob_storage_path_prefix + "/"
+        first_slash_index = path_prefix.find("/")
+        bucket_name = path_prefix[:first_slash_index]
+        blob_storage_bucket = storage.Client(project=project_id).bucket(bucket_name)
+        blob_storage_folder = path_prefix[first_slash_index + 1 :]
+        return blob_storage_bucket, blob_storage_folder
+
+    raise app.UsageError(
+        "Tensorboard resource {} is obsolete. Please create a new one.".format(
+            FLAGS.tensorboard_resource_name
+        ),
+        exitcode=0,
     )

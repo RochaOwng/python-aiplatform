@@ -32,6 +32,7 @@ from typing import (
     Tuple,
 )
 import uuid
+import threading
 
 import grpc
 from tensorboard.backend import process_graph
@@ -41,7 +42,9 @@ from tensorboard.backend.event_processing.plugin_event_accumulator import (
 from tensorboard.backend.event_processing.plugin_event_accumulator import (
     event_file_loader,
 )
-from tensorboard.backend.event_processing.plugin_event_accumulator import io_wrapper
+from tensorboard.backend.event_processing.plugin_event_accumulator import (
+    io_wrapper,
+)
 from tensorboard.compat.proto import graph_pb2
 from tensorboard.compat.proto import summary_pb2
 from tensorboard.compat.proto import types_pb2
@@ -56,15 +59,27 @@ import tensorflow as tf
 
 from google.api_core import exceptions
 from google.cloud import storage
-from google.cloud.aiplatform.compat.services import tensorboard_service_client
+from google.cloud.aiplatform import initializer
+from google.cloud.aiplatform.utils import TensorboardClientWithOverride
+from google.cloud.aiplatform.constants import base as constants
+from google.cloud.aiplatform.compat.services import (
+    tensorboard_service_client,
+)
 from google.cloud.aiplatform.compat.types import tensorboard_data
 from google.cloud.aiplatform.compat.types import tensorboard_experiment
 from google.cloud.aiplatform.compat.types import tensorboard_service
 from google.cloud.aiplatform.compat.types import tensorboard_time_series
 from google.cloud.aiplatform.tensorboard import uploader_utils
-from google.cloud.aiplatform.tensorboard.plugins.tf_profiler import profile_uploader
+from google.cloud.aiplatform.tensorboard import uploader_constants
+from google.cloud.aiplatform.tensorboard.plugins.tf_profiler import (
+    profile_uploader,
+)
 from google.protobuf import message
 from google.protobuf import timestamp_pb2 as timestamp
+from google.cloud.aiplatform import base
+
+
+_LOGGER = base.Logger(__name__)
 
 TensorboardServiceClient = tensorboard_service_client.TensorboardServiceClient
 
@@ -189,6 +204,7 @@ class TensorBoardUploader(object):
         self._allowed_plugins = frozenset(allowed_plugins)
         self._run_name_prefix = run_name_prefix
         self._is_brand_new_experiment = False
+        self._continue_uploading = True
 
         self._upload_limits = upload_limits
         if not self._upload_limits:
@@ -388,20 +404,23 @@ class TensorBoardUploader(object):
                     "performance."
                 )
 
-        while True:
+        while self._continue_uploading:
             self._logdir_poll_rate_limiter.tick()
             self._upload_once()
             if self._one_shot:
                 break
         if self._one_shot and not self._tracker.has_data():
             logger.warning(
-                "One-shot mode was used on a logdir (%s) "
-                "without any uploadable data" % self._logdir
+                "One-shot mode was used on a logdir (%s) without any uploadable data"
+                % self._logdir
             )
 
+    def _end_uploading(self):
+        self._continue_uploading = False
+
     def _pre_create_runs_and_time_series(self):
-        """
-        Iterates though the log dir to collect TensorboardRuns and
+        """Iterates though the log dir to collect TensorboardRuns and
+
         TensorboardTimeSeries that need to be created, and creates them in batch
         to speed up uploading later on.
         """
@@ -472,6 +491,187 @@ class TensorBoardUploader(object):
 
         with self._tracker.send_tracker():
             self._dispatcher.dispatch_requests(run_to_events)
+
+
+class _TensorBoardTracker:
+    "Tracks TensorBoard uploader and uploader thread"
+
+    def __init__(self):
+        self._tensorboard_uploader: Optional[TensorBoardUploader] = None
+
+    def upload_tb_log(
+        self,
+        tensorboard_id: str,
+        tensorboard_experiment_name: str,
+        logdir: str,
+        experiment_display_name: Optional[str] = None,
+        run_name_prefix: Optional[str] = None,
+        description: Optional[str] = None,
+        verbosity: Optional[int] = 1,
+    ):
+        """upload only the existing data in the logdir and then return immediately
+
+        ```
+        aiplatform.init(location='us-central1', project='my-project')
+        aiplatform.upload_tb_log(tensorboard_id='123',tensorboard_experiment_name='my-experiment',logdir='my-logdir')
+        ```
+
+        Args:
+          tensorboard_id (str): Required. TensorBoard ID.
+          tensorboard_experiment_name (str): Required. Name of this tensorboard
+            experiment. Unique to the given
+            projects/{project}/locations/{location}/tensorboards/{tensorboard_id}
+          logdir (str): Required. path of the log directory to upload
+          experiment_display_name (str): Optional. The display name of the
+            experiment.
+          run_name_prefix (str): Optional. If present, all runs created by this
+            invocation will have their name prefixed by this value.
+          description (str): Optional. String description to assign to the
+            experiment.
+          verbosity (str): Optional. Level of verbosity, an integer. Supported
+            value: 0 - No upload statistics is printed. 1 - Print upload statistics
+              while uploading data (default).
+        """
+        project = initializer.global_config.project
+        location = initializer.global_config.location
+        tensorboard_resource_name = TensorboardServiceClient.tensorboard_path(
+            project, location, tensorboard_id
+        )
+        api_client = initializer.global_config.create_client(
+            client_class=TensorboardClientWithOverride
+        )
+        (
+            blob_storage_bucket,
+            blob_storage_folder,
+        ) = uploader_utils.get_blob_storage_bucket_and_folder(
+            api_client, tensorboard_resource_name, project
+        )
+        tensorboard_uploader = TensorBoardUploader(
+            experiment_name=tensorboard_experiment_name,
+            tensorboard_resource_name=tensorboard_resource_name,
+            experiment_display_name=experiment_display_name,
+            blob_storage_bucket=blob_storage_bucket,
+            blob_storage_folder=blob_storage_folder,
+            allowed_plugins=uploader_constants.ALLOWED_PLUGINS,
+            writer_client=api_client,
+            logdir=logdir,
+            one_shot=True,
+            run_name_prefix=run_name_prefix,
+            description=description,
+            verbosity=verbosity,
+        )
+        tensorboard_uploader.create_experiment()
+        print(
+            "View your Tensorboard at https://{}.{}/experiment/{}".format(
+                location,
+                "tensorboard.googleusercontent.com",
+                self.tensorboard_uploader.get_experiment_resource_name().replace(
+                    "/", "+"
+                ),
+            )
+        )
+        tensorboard_uploader.start_uploading()
+        tensorboard_uploader = None
+        _LOGGER.info("One time TensorBoard log upload completed.")
+
+    def start_upload_tb_log(
+        self,
+        tensorboard_id: str,
+        tensorboard_experiment_name: str,
+        logdir: str,
+        experiment_display_name: Optional[str] = None,
+        run_name_prefix: Optional[str] = None,
+        description: Optional[str] = None,
+    ):
+        """continues to listen for new data in the logdir and uploads when it appears.
+
+        ```
+        aiplatform.init(location='us-central1', project='my-project')
+        aiplatform.start_upload_tb_log(tensorboard_id='123',tensorboard_experiment_name='my-experiment',logdir='my-logdir')
+        ```
+
+        Args:
+          tensorboard_id (str): Required. TensorBoard ID.
+          tensorboard_experiment_name (str): Required. Name of this tensorboard
+            experiment. Unique to the given
+            projects/{project}/locations/{location}/tensorboards/{tensorboard_id}
+          logdir (str): Required. path of the log directory to upload
+          experiment_display_name (str): Optional. The display name of the
+            experiment.
+          run_name_prefix (str): Optional. If present, all runs created by this
+            invocation will have their name prefixed by this value.
+          description (str): Optional. String description to assign to the
+            experiment.
+        """
+        if self._tensorboard_uploader:
+            print(
+                "TensorBoard uploader is already running for {}. To start a new"
+                " uploader, please call end_upload_tb_log() to end the current one".format(
+                    self._tensorboard_uploader.get_experiment_resource_name()
+                )
+            )
+            return
+        project = initializer.global_config.project
+        location = initializer.global_config.location
+        tensorboard_resource_name = TensorboardServiceClient.tensorboard_path(
+            project, location, tensorboard_id
+        )
+        api_client = initializer.global_config.create_client(
+            client_class=TensorboardClientWithOverride
+        )
+        (
+            blob_storage_bucket,
+            blob_storage_folder,
+        ) = uploader_utils.get_blob_storage_bucket_and_folder(
+            api_client, tensorboard_resource_name, project
+        )
+
+        self._tensorboard_uploader = TensorBoardUploader(
+            experiment_name=tensorboard_experiment_name,
+            tensorboard_resource_name=tensorboard_resource_name,
+            experiment_display_name=experiment_display_name,
+            blob_storage_bucket=blob_storage_bucket,
+            blob_storage_folder=blob_storage_folder,
+            allowed_plugins=uploader_constants.ALLOWED_PLUGINS,
+            writer_client=api_client,
+            logdir=logdir,
+            one_shot=False,
+            run_name_prefix=run_name_prefix,
+            description=description,
+            verbosity=0,
+        )
+        self._tensorboard_uploader.create_experiment()
+        print(
+            "View your Tensorboard at https://{}.{}/experiment/{}".format(
+                location,
+                "tensorboard.googleusercontent.com",
+                self._tensorboard_uploader.get_experiment_resource_name().replace(
+                    "/", "+"
+                ),
+            )
+        )
+        threading.Thread(target=self._tensorboard_uploader.start_uploading).start()
+
+    def end_upload_tb_log(self):
+        """Ends the current TensorBoard uploader
+
+        ```
+        aiplatform.start_upload_tb_log(...)
+        ...
+        aiplatform.end_upload_tb_log()
+        ```
+        """
+        if not self._tensorboard_uploader:
+            print(
+                "No TensorBoard uploader is running. To start a new uploader, call"
+                " start_upload_tb_log()."
+            )
+            return
+        self._tensorboard_uploader._end_uploading()
+        self._tensorboard_uploader = None
+
+
+_tensorboard_tracker = _TensorBoardTracker()
 
 
 class PermissionDeniedError(RuntimeError):
